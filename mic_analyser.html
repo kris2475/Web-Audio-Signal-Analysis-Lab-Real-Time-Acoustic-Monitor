@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Microphone Analyzer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .data-panel { height: 100px; }
+        .progress-bar-inner { transition: width 0.1s ease-out; }
+        .frequency-bar { transition: height 0.1s ease-out; }
+        /* Visualization box style for FFT spectrum */
+        .visualization-box { 
+            height: 200px; 
+            display: flex; 
+            align-items: flex-end; 
+            justify-content: space-between; 
+            padding: 10px; 
+            background-color: #1f2937; 
+            border-radius: 0.5rem; 
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-4xl mx-auto space-y-8">
+        <header class="text-center">
+            <h1 class="text-3xl font-bold text-teal-400">Standalone Audio Analysis Lab</h1>
+            <p class="text-gray-400 mt-1">Real-time analysis of microphone input: Energy (RMS) and Frequency (FFT).</p>
+        </header>
+
+        <!-- Status Panel -->
+        <div id="status" class="p-4 rounded-lg shadow-lg bg-gray-800 text-center">
+            <span class="text-yellow-400 font-semibold">Ready. Click 'Start Microphone Pick Up' to begin analysis.</span>
+        </div>
+
+        <!-- Section 1: Microphone Pick Up & Signal Analysis (FFT, Energy, Tx) -->
+        <div class="bg-gray-800 p-6 rounded-xl shadow-2xl space-y-4 border border-gray-700">
+            <h2 class="text-2xl font-semibold text-sky-400 border-b border-gray-700 pb-2">Microphone Analysis (Web Audio API)</h2>
+            
+            <!-- Controls -->
+            <div>
+                <button onclick="startMic()" id="mic-button" class="w-full py-3 rounded-lg bg-red-600 hover:bg-red-700 transition duration-150 font-bold disabled:bg-gray-500">
+                    Start Microphone Pick Up
+                </button>
+                <div id="mic-status" class="text-sm mt-2 text-center text-yellow-300"></div>
+            </div>
+
+            <div id="analysis-output" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Data Panel 1: Energy Analysis (RMS) -->
+                <div class="p-4 bg-gray-700 rounded-lg">
+                    <p class="text-lg font-medium text-gray-200">Energy Analysis (RMS Amplitude)</p>
+                    <div class="text-3xl font-mono text-green-400 mt-2" id="rms-output">0.000</div>
+                    <div class="w-full bg-gray-600 rounded-full h-2.5 mt-2">
+                        <div class="progress-bar-inner bg-green-500 h-2.5 rounded-full" style="width: 0%" id="rms-bar"></div>
+                    </div>
+                </div>
+
+                <!-- Data Panel 2: Fourier Transform (Peak Frequency) -->
+                <div class="p-4 bg-gray-700 rounded-lg">
+                    <p class="text-lg font-medium text-gray-200">Fourier Transform (Peak Frequency)</p>
+                    <div class="text-3xl font-mono text-pink-400 mt-2"><span id="fft-output">0</span> Hz</div>
+                    <p class="text-sm text-gray-400 mt-1">Loudest frequency bin detected.</p>
+                </div>
+            </div>
+
+            <!-- Frequency Spectrum Visualization -->
+            <div>
+                <p class="text-lg font-medium text-gray-200 mb-2">Real-time FFT Visualization</p>
+                <div id="frequency-spectrum" class="visualization-box">
+                    <!-- Bars will be injected here -->
+                </div>
+            </div>
+        </div>
+        
+    </div>
+
+    <script>
+        // --- Global Config and Constants ---
+        const ANALYZER_FFT_SIZE = 1024; // Determines the granularity of the frequency analysis
+        const BAR_COUNT = 64; // Number of frequency bars to display in the visualization
+
+        // Web Audio API State
+        let audioContext;
+        let analyser;
+        let micSource;
+        let micStream;
+        let timeDomainData; // Used for RMS/Energy calculation
+        let frequencyData; // Used for FFT/Frequency calculation
+        let animationFrameId;
+
+        // UI Elements
+        const micButton = document.getElementById('mic-button');
+        const micStatus = document.getElementById('mic-status');
+        const rmsOutput = document.getElementById('rms-output');
+        const rmsBar = document.getElementById('rms-bar');
+        const fftOutput = document.getElementById('fft-output');
+        const freqSpectrumDiv = document.getElementById('frequency-spectrum');
+        const statusDiv = document.getElementById('status');
+        
+        // Array to hold the bar DOM elements for fast updates
+        let frequencyBars = [];
+        
+        /** Initializes the visualization bars. */
+        function initVisualizationBars() {
+            // Clear existing bars if they exist
+            freqSpectrumDiv.innerHTML = '';
+            frequencyBars = []; 
+            
+            for (let i = 0; i < BAR_COUNT; i++) {
+                const bar = document.createElement('div');
+                // w-1 is a utility class for width, flex-grow allows it to fill space, mx-px is margin x-axis 1px
+                bar.className = 'frequency-bar w-1 flex-grow bg-pink-500 mx-px';
+                bar.style.height = '0%';
+                bar.style.minWidth = '2px';
+                freqSpectrumDiv.appendChild(bar);
+                frequencyBars.push(bar);
+            }
+        }
+
+        /** Main analysis loop running on requestAnimationFrame. */
+        function analyzeMic() {
+            animationFrameId = requestAnimationFrame(analyzeMic);
+
+            // --- 1. Get Time Domain Data (for Energy Analysis / RMS) ---
+            // Fills the timeDomainData array with the current waveform data (0-255 range)
+            analyser.getByteTimeDomainData(timeDomainData);
+            
+            let sumOfSquares = 0;
+            for (const amplitude of timeDomainData) {
+                // Convert 0-255 byte value to a normalized -1.0 to 1.0 range
+                const normalized = (amplitude - 128) / 128.0;
+                sumOfSquares += normalized * normalized;
+            }
+            
+            // Calculate RMS (Root Mean Square) - standard measure of audio power
+            const rms = Math.sqrt(sumOfSquares / timeDomainData.length);
+            
+            // Update UI for RMS
+            const rmsValue = rms.toFixed(3);
+            rmsOutput.textContent = rmsValue;
+            // Scale RMS (which maxes at 1.0) to 100% for the progress bar
+            const barWidth = Math.min(rms * 200, 100); 
+            rmsBar.style.width = `${barWidth}%`;
+
+
+            // --- 2. Get Frequency Data (for Fourier Transform / FFT) ---
+            // Fills the frequencyData array with frequency magnitude data (0-255 range)
+            analyser.getByteFrequencyData(frequencyData);
+
+            let maxIndex = 0;
+            let maxAmplitude = 0;
+            
+            // Calculate the frequency resolution: SampleRate / FFT_SIZE
+            const sampleRate = audioContext.sampleRate;
+            const binWidth = sampleRate / ANALYZER_FFT_SIZE; 
+
+            // Update FFT Visualization
+            for (let i = 0; i < BAR_COUNT; i++) {
+                // Determine which frequency bin to sample for this bar
+                const binIndex = i * Math.floor(analyser.frequencyBinCount / BAR_COUNT);
+                const amplitude = frequencyData[binIndex];
+                
+                // Find peak amplitude across the sampled bins
+                if (amplitude > maxAmplitude) {
+                    maxAmplitude = amplitude;
+                    maxIndex = binIndex;
+                }
+                
+                // Update bar height (0-255 maps to 0-100% height)
+                const heightPercent = (amplitude / 255) * 100;
+                if (frequencyBars[i]) {
+                    frequencyBars[i].style.height = `${heightPercent}%`;
+                }
+            }
+            
+            // Calculate and display the peak frequency
+            const peakFrequency = Math.floor(maxIndex * binWidth);
+            fftOutput.textContent = peakFrequency.toString().padStart(4, '0');
+        }
+
+        /** Handles microphone access and setup. */
+        async function startMic() {
+            if (micStream) {
+                // Stop function (toggle behavior)
+                cancelAnimationFrame(animationFrameId);
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+                micButton.textContent = 'Start Microphone Pick Up';
+                micButton.classList.remove('bg-green-600', 'hover:bg-green-700');
+                micButton.classList.add('bg-red-600', 'hover:bg-red-700');
+                micStatus.textContent = 'Microphone stopped.';
+                statusDiv.innerHTML = '<span class="text-yellow-400 font-semibold">Ready. Click \'Start Microphone Pick Up\' to begin analysis.</span>';
+                
+                // Reset visualization and output
+                rmsOutput.textContent = '0.000';
+                rmsBar.style.width = '0%';
+                fftOutput.textContent = '0';
+                initVisualizationBars();
+                
+                return;
+            }
+            
+            micButton.disabled = true;
+            micButton.textContent = 'Requesting Microphone Access...';
+            
+            try {
+                // 1. Get media stream
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                // 2. Setup AudioContext and Nodes
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = ANALYZER_FFT_SIZE;
+                analyser.smoothingTimeConstant = 0.5; // Smooths out the visualization
+
+                micSource = audioContext.createMediaStreamSource(micStream);
+                
+                // 3. Connect the source to the analyzer
+                micSource.connect(analyser);
+
+                // Initialize data arrays for analysis
+                timeDomainData = new Uint8Array(analyser.fftSize); 
+                frequencyData = new Uint8Array(analyser.frequencyBinCount); 
+
+                // 4. Start analysis loop
+                initVisualizationBars();
+                analyzeMic();
+
+                // 5. Update UI
+                micButton.textContent = 'Stop Microphone Pick Up';
+                micButton.classList.remove('bg-red-600', 'hover:bg-red-700');
+                micButton.classList.add('bg-green-600', 'hover:bg-green-700');
+                micStatus.innerHTML = `<span class="text-green-400">Mic Active. Sample Rate: ${audioContext.sampleRate} Hz.</span>`;
+                statusDiv.innerHTML = '<span class="text-green-400 font-semibold">Microphone active. Real-time analysis transmitting.</span>';
+
+            } catch (err) {
+                console.error('Microphone Access Error:', err);
+                micStatus.innerHTML = '<span class="text-red-500">Error: Microphone access denied. Check browser permissions.</span>';
+                statusDiv.innerHTML = '<span class="text-red-500 font-semibold">Microphone access failed.</span>';
+            } finally {
+                micButton.disabled = false;
+            }
+        }
+        
+        // Ensure the visualization bars are initialized when the window loads
+        window.onload = function() {
+            initVisualizationBars();
+        };
+
+    </script>
+</body>
+</html>
